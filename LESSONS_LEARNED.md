@@ -25,6 +25,12 @@
 - **解决**: 切换到 `GOPROXY=https://goproxy.cn,direct`
 - **教训**: 国内网络环境下，Go proxy 需要备选方案
 
+#### 4. golangci-lint 版本不兼容 Go 1.26
+- **问题**: CI 里用 golangci-lint v1.59 → typecheck 报错；升级到 v2.1 → 报 `Go language version (go1.24) lower than targeted Go version (1.26.5)`
+- **原因**: golangci-lint 的发布版本是用固定 Go 版本编译的，如果项目的 Go 版本比它新就会挂
+- **解决**: 用 `go vet`（Go 内置，版本永远匹配）替代 golangci-lint
+- **教训**: 第三方 lint 工具的 Go 版本兼容性是个隐藏坑，MVP 阶段 `go vet` 完全够用
+
 ### Good Patterns
 
 #### 1. Persist-before-acknowledge 模式
