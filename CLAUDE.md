@@ -45,18 +45,30 @@ make test
 
 ## Git & Merge Rules
 
-- All work on feature branches, never commit directly to `main`.
-- Branch naming: `feat/xxx`, `fix/xxx`, `refactor/xxx`.
-- Every PR must pass CI (lint + test + build) before merge.
-- Squash merge to main — keep history clean.
-- Commit messages: `feat:`, `fix:`, `refactor:`, `test:`, `docs:` prefixes.
+### Branch Model
+
+- `main` — production-ready code, only accepts merges from `dev`
+- `dev` — integration branch, all feature/bug branches merge here first
+- Feature branches: `feat/xxx` — branch off `dev`, merge back to `dev`
+- Bug fix branches: `bug/xxx` — named after the bug, branch off `dev`, merge back to `dev`
+- Refactor branches: `refactor/xxx`
+
+### Workflow
+
+1. 日常开发在 `dev` 分支上切子分支
+2. Bug 修复必须切一个以 bug 命名的分支（如 `bug/redis-reconnect`、`bug/template-nil-payload`）
+3. PR 合入 `dev` 时必须通过 CI
+4. `dev` 合入 `main` 时必须通过 CI
+5. 不允许直接 push 到 `main` 或 `dev`
+6. Squash merge — keep history clean
+7. Commit messages: `feat:`, `fix:`, `refactor:`, `test:`, `docs:` prefixes
 
 ## CI
 
-GitHub Actions pipeline runs on every push and PR:
-1. `golangci-lint` — static analysis
-2. `go test ./...` — all tests
-3. `go build ./...` — compile check
+GitHub Actions pipeline runs on every push and PR to `main` and `dev`:
+1. `go vet ./...` — static analysis
+2. `go test ./... -race` — all tests with race detector
+3. `go build` — compile server + worker
 
 CI must pass before merge. Do not skip or force-merge failing CI.
 
