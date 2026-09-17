@@ -130,3 +130,33 @@ notify-service/
 ## Design Document
 
 See [docs/design.md](docs/design.md) for the full design document covering system boundary, reliability guarantees, failure handling, and trade-offs.
+
+## Branch Model & Contributing
+
+```
+main (stable) ← dev (integration) ← feat/xxx or bug/xxx
+```
+
+- `main` — production-ready, only accepts merges from `dev`
+- `dev` — integration branch, all work merges here first
+- Feature branches: `feat/xxx`, branched from `dev`
+- Bug fix branches: `bug/xxx`, named after the bug (e.g. `bug/redis-reconnect`), branched from `dev`
+
+### Workflow
+
+```bash
+# Start from dev
+git checkout dev && git pull
+
+# Create a branch
+git checkout -b bug/template-nil-payload   # for bugs
+git checkout -b feat/rate-limiting         # for features
+
+# Make changes, then push and create PR to dev
+git push -u origin bug/template-nil-payload
+gh pr create --base dev
+
+# CI must pass before merge
+```
+
+CI (go vet + test + build) runs on every push/PR to `main` and `dev`.
