@@ -8,7 +8,207 @@ Internal systems trigger notifications on business events (user registration, pa
 
 ---
 
-## 1. System Boundary
+## 1. 交互流程（Interface & Sequence Diagrams）
+
+以下泳道图从调用方视角出发，覆盖所有正常和异常路径。这是理解整个系统的入口。
+
+### 1.1 正常路径：创建通知 → 投递成功
+
+```mermaid
+sequenceDiagram
+    participant Caller as Internal System
+    participant API as API Server
+    participant DB as PostgreSQL
+    participant Q as Redis Queue
+    participant W as Worker
+    participant V as Vendor API
+
+    Caller->>API: POST /api/v1/notifications
+    API->>DB: INSERT notification (status=pending)
+    DB-->>API: OK
+    API->>Q: LPUSH notification_id
+    Q-->>API: OK
+    API-->>Caller: 201 Created
+
+    W->>Q: BRPOP (blocking wait)
+    Q-->>W: notification_id
+    W->>DB: SELECT notification + vendor_config
+    DB-->>W: notification data
+    W->>DB: UPDATE status=processing
+    W->>W: render body_template with payload
+    W->>V: HTTP request (method, url, headers, rendered body)
+    V-->>W: 200 OK
+    W->>DB: UPDATE status=delivered
+```
+
+关键点：**先写 DB 再入队，再返回 201**。调用方收到 201 时，数据已经持久化。
+
+### 1.2 异常路径 1：Redis 宕机
+
+```mermaid
+sequenceDiagram
+    participant Caller as Internal System
+    participant API as API Server
+    participant DB as PostgreSQL
+    participant Q as Redis Queue
+    participant RS as Recovery Sweep
+
+    Caller->>API: POST /api/v1/notifications
+    API->>DB: INSERT notification (status=pending)
+    DB-->>API: OK
+    API->>Q: LPUSH notification_id
+    Q--xAPI: ERROR (Redis down)
+    Note over API: Redis 失败，但 DB 已写入<br/>通知不会丢失
+    API-->>Caller: 201 Created
+
+    Note over RS: 每 30s 扫描一次
+    RS->>DB: SELECT * WHERE status='pending'<br/>AND created_at < now() - 1min
+    DB-->>RS: orphaned notifications
+    RS->>Q: LPUSH notification_ids (Redis 恢复后)
+    Note over RS: 通知重新进入正常投递流程
+```
+
+关键点：Redis 只是信号通道，不是数据源。即使 Redis 丢数据或宕机，recovery sweep 兜底。
+
+### 1.3 异常路径 2：Vendor 返回 5xx → 重试 → 最终成功
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant DB as PostgreSQL
+    participant V as Vendor API
+    participant RS as Retry Sweep
+
+    W->>V: HTTP request (attempt 1)
+    V-->>W: 503 Service Unavailable
+    W->>DB: UPDATE status=failed,<br/>attempts=1,<br/>next_retry_at=now()+2s,<br/>last_error='503'
+
+    Note over RS: retry sweep 每 10s 扫描
+    RS->>DB: SELECT * WHERE status='failed'<br/>AND next_retry_at < now()
+    DB-->>RS: retryable notification
+    RS->>DB: UPDATE status=processing
+    RS->>V: HTTP request (attempt 2)
+    V-->>RS: 200 OK
+    RS->>DB: UPDATE status=delivered, attempts=2
+```
+
+重试间隔：`2s → 4s → 8s → 16s → 32s`（指数退避 + 20% jitter）。
+
+### 1.4 异常路径 3：Vendor 持续失败 → Dead Letter
+
+```mermaid
+sequenceDiagram
+    participant W as Worker / Retry Sweep
+    participant DB as PostgreSQL
+    participant V as Vendor API
+
+    W->>V: HTTP request (attempt 1)
+    V-->>W: 500
+    W->>DB: UPDATE status=failed, attempts=1, next_retry_at=+2s
+
+    Note over W: ... attempts 2~4 同样失败 ...
+
+    W->>V: HTTP request (attempt 5, max_retries reached)
+    V-->>W: 500
+    W->>DB: UPDATE status=dead_letter,<br/>attempts=5,<br/>last_error='500 after 5 attempts'
+    Note over DB: dead_letter 状态终态<br/>需要人工介入或告警
+```
+
+### 1.5 异常路径 4：Worker 崩溃 → Recovery Sweep 回收
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant DB as PostgreSQL
+    participant Q as Redis Queue
+    participant RS as Recovery Sweep
+
+    W->>Q: BRPOP → notification_id
+    W->>DB: UPDATE status=processing
+    W->>W: CRASH (进程崩溃)
+    Note over DB: 通知卡在 processing 状态<br/>无人处理
+
+    Note over RS: 每 30s 扫描一次
+    RS->>DB: SELECT * WHERE status='processing'<br/>AND updated_at < now() - 2min
+    DB-->>RS: stale notifications
+    RS->>DB: UPDATE status=pending
+    RS->>Q: LPUSH notification_ids
+    Note over RS: 通知重新回到队列，正常投递
+```
+
+关键点：用 `updated_at` 超时判断 worker 是否已失联，2 分钟无更新视为卡死。
+
+### 1.6 异常路径 5：DB 宕机 → 拒绝请求
+
+```mermaid
+sequenceDiagram
+    participant Caller as Internal System
+    participant API as API Server
+    participant DB as PostgreSQL
+
+    Caller->>API: POST /api/v1/notifications
+    API->>DB: INSERT notification
+    DB--xAPI: ERROR (connection refused)
+    API-->>Caller: 503 Service Unavailable
+    Note over API: 宁可拒绝也不丢数据<br/>调用方应重试
+```
+
+关键点：**不做假确认**。DB 写不进去就直接报错，调用方自行重试。这是 at-least-once 的基石。
+
+### 1.7 异常路径 6：模板渲染失败
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant DB as PostgreSQL
+
+    W->>DB: SELECT notification + vendor_config
+    W->>W: render body_template with payload
+    Note over W: 模板语法错误 或<br/>payload 缺少必要字段
+    W->>DB: UPDATE status=dead_letter,<br/>last_error='template render: missing key "user_id"'
+    Note over DB: 模板错误不重试<br/>重试也不会成功，直接 dead letter
+```
+
+关键点：模板渲染是确定性操作——同样的输入永远产生同样的错误，重试没有意义，直接进 dead letter。
+
+### 1.8 异常路径 7：网络分区 → 重复投递
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant DB as PostgreSQL
+    participant V as Vendor API
+
+    W->>V: HTTP request
+    Note over W,V: 网络分区：vendor 实际收到了请求<br/>并成功处理，但 worker 没收到响应
+    V--xW: TIMEOUT
+    W->>DB: UPDATE status=failed,<br/>next_retry_at=+2s,<br/>last_error='timeout'
+
+    Note over W: retry sweep 触发重试
+    W->>V: HTTP request (重复！)
+    V-->>W: 200 OK
+    W->>DB: UPDATE status=delivered
+    Note over V: vendor 收到了两次相同请求<br/>这是 at-least-once 的已知代价
+```
+
+关键点：这是 at-least-once 语义下不可避免的代价。真正的 exactly-once 需要 vendor 侧支持幂等（接受 idempotency key 并去重），我们无法控制外部 API。
+
+### 1.9 接口总览
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /api/v1/notifications | 提交通知 |
+| GET | /api/v1/notifications/:id | 查询投递状态 |
+| POST | /api/v1/vendors | 创建 vendor 配置 |
+| GET | /api/v1/vendors | 列出所有 vendor |
+| GET | /api/v1/vendors/:id | 查询 vendor 详情 |
+| PUT | /api/v1/vendors/:id | 更新 vendor 配置 |
+| DELETE | /api/v1/vendors/:id | 删除 vendor |
+| GET | /healthz | 健康检查 |
+
+---
+
+## 2. System Boundary
 
 ### What This System Does
 
@@ -38,7 +238,7 @@ This boundary keeps the system simple enough to reason about its reliability gua
 
 ---
 
-## 2. Reliability and Failure Handling
+## 3. Reliability and Failure Handling
 
 ### Delivery Semantics: At-Least-Once
 
@@ -48,29 +248,23 @@ We guarantee **at-least-once delivery**. Every notification will be delivered to
 
 ### The Persist-Before-Acknowledge Pattern
 
-The core reliability mechanism is simple: **write to the database before returning success to the caller**.
+The core reliability mechanism: **write to the database before returning success to the caller**. See 1.1 正常路径 for the complete sequence.
 
-```
-1. Caller sends POST /api/v1/notifications
-2. Service writes notification to PostgreSQL (status: pending)
-3. Service enqueues notification ID to Redis
-4. Service returns 201 Created
-```
+The only way to lose a notification is if the database write itself fails, in which case we return an error to the caller (no false acknowledgment). See 1.6 DB 宕机 for this case.
 
-If step 3 fails (Redis is down), the notification is still safe in PostgreSQL. A recovery sweep will pick it up. If the service crashes between steps 2 and 4, the caller will get an error — but the notification is persisted and will still be delivered.
+### Failure Mode Summary
 
-The only way to lose a notification is if the database write itself fails, in which case we return an error to the caller (no false acknowledgment).
+All failure modes have been illustrated in the sequence diagrams above (Section 1.2–1.8). Here is a quick reference:
 
-### Failure Mode Matrix
-
-| Failure | Impact | Mitigation |
+| Failure | Diagram | Mitigation |
 |---|---|---|
-| **Redis down** | Notifications persist in DB but don't enter the queue | Recovery sweep (every 30s) finds `pending` notifications older than 1 minute and re-enqueues them |
-| **Worker crash** | In-flight notifications stuck in `processing` | Recovery sweep finds `processing` notifications with `updated_at` older than 2 minutes and re-enqueues them |
-| **Vendor returns 5xx** | Delivery fails for that attempt | Exponential backoff retry: 2s → 4s → 8s → 16s → 32s (with 20% jitter). Configurable max retries per vendor. |
-| **Vendor permanently unreachable** | All retries exhausted | Notification moves to `dead_letter` state. Requires manual intervention or alerting (future). |
-| **Database down** | API returns 503 to callers | We reject requests rather than accept-and-lose. Workers pause until DB recovers. No data loss. |
-| **Network partition** | Vendor may have received the request but we didn't get the ACK | At-least-once semantics: we retry, vendor may get a duplicate. This is by design. |
+| Redis down | 1.2 | Recovery sweep re-enqueues from DB |
+| Vendor 5xx | 1.3 | Exponential backoff retry |
+| Vendor permanently down | 1.4 | Dead letter after max retries |
+| Worker crash | 1.5 | Recovery sweep reclaims stale `processing` |
+| Database down | 1.6 | API rejects request — no false ACK |
+| Template render error | 1.7 | Direct dead letter — no retry |
+| Network partition | 1.8 | At-least-once duplicate — by design |
 
 ### Retry Design
 
@@ -99,7 +293,7 @@ pending ──► processing ──► delivered        (retry)
 
 ---
 
-## 3. Architecture
+## 4. Architecture
 
 ### Components
 
@@ -155,7 +349,7 @@ With `pgx` and hand-written SQL, every query is explicit and the sweep queries c
 
 ---
 
-## 4. Vendor Configuration Abstraction
+## 5. Vendor Configuration Abstraction
 
 Each vendor is configured with:
 
@@ -180,7 +374,7 @@ If no body template is configured, the raw payload JSON is sent as-is.
 
 ---
 
-## 5. Trade-offs and Evolution
+## 6. Trade-offs and Evolution
 
 ### Decisions Made
 
@@ -219,7 +413,7 @@ If no body template is configured, the raw payload JSON is sent as-is.
 
 ---
 
-## 6. Data Model
+## 7. Data Model
 
 ### notifications table
 

@@ -122,14 +122,13 @@ notify-service/
 │   ├── repository/             # Database queries
 │   ├── service/                # Business logic (create + delivery)
 │   └── template/               # Body template rendering
-├── docs/design.md              # Design document
 ├── docker-compose.yml
 └── Makefile
 ```
 
 ## Design Document
 
-See [docs/design.md](docs/design.md) for the full design document covering system boundary, reliability guarantees, failure handling, and trade-offs.
+See [design.md](../design.md) for the full design document covering interaction sequences, system boundary, reliability guarantees, failure handling, and trade-offs.
 
 ## Branch Model & Contributing
 
